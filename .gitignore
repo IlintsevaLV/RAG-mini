@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# --- Модели и кеши (ОГРОМНЫЕ, НЕ В GIT) ---
+models/
+*.gguf
+*.safetensors
+*.bin
+.cache/
+huggingface/
+
+# --- Данные ---
+data/*.pdf
+
+# --- Артефакты RAG ---
+*.npy
+faiss.index
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Логи и временные файлы ---
+*.log
+tmp/
+temp/
+test_results*.json
