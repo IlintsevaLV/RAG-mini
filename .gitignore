@@ -19,6 +19,7 @@ models/
 *.bin
 .cache/
 huggingface/
+models/tesseract/
 
 # --- Данные ---
 data/*.pdf

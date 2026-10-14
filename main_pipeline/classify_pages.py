@@ -18,8 +18,8 @@ import re
 from pathlib import Path
 from collections import Counter
 
-PAGES_PATH = Path("pages.json")
-
+BASE_DIR = Path(__file__).resolve().parent
+PAGES_PATH = BASE_DIR / "pages.json"
 
 # Метрики
 def lines(text):
@@ -37,7 +37,10 @@ def frac_lines_with_dots(text):
     ls = lines(text)
     if not ls:
         return 0.0
-    return sum(1 for l in ls if re.search(r"\.{3,}", l)) / len(ls)
+    # Ищем 3+ точек, возможно разделённых пробелами:
+    # "..." или ". . ." или ". . . ."
+    pattern = re.compile(r"(\.[\s]?){3,}")
+    return sum(1 for l in ls if pattern.search(l)) / len(ls)
 
 
 def avg_line_length(text):
@@ -74,6 +77,7 @@ def classify_page(page: dict) -> str:
     if not ls:
         return "content"
 
+    has_tables = page.get("n_tables", 0) > 0
     text_upper = text.upper()
 
     # 1. ТИТУЛЬНИК — строго: только стр. 1–3 + сильные признаки
@@ -152,13 +156,13 @@ def needs_classification(doc):
 def classify_document(doc, doc_name):
     """Классифицирует все страницы одного документа"""
     print(f"\n {doc_name}")
-    print(f"{'стр.':>5} {'симв.':>6}  {'тип':<9} метрики")
+    print(f"{'стр.':>5} {'симв.':>6} {'tbl':>4}  {'тип':<9} метрики")
     print("-" * 100)
 
     for p in doc["pages"]:
         p["type"] = classify_page(p)
         print(
-            f"{p['page']:>5} {p['n_chars']:>6}  {p['type']:<9} "
+            f"{p['page']:>5} {p['n_chars']:>6} {p.get('n_tables', 0):>4}  {p['type']:<9} "
             f"| dgt={frac_lines_ending_with_digit(p['text']):.2f} "
             f"dots={frac_lines_with_dots(p['text']):.2f} "
             f"len={avg_line_length(p['text']):.1f} "

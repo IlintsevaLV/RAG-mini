@@ -10,6 +10,10 @@ import json
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from rag import (
     load_resources,
     answer_one,
@@ -95,7 +99,9 @@ def run_batch(chunks, index, embed_model, reranker, llm):
         r = answer_one(q, chunks, index, embed_model, reranker, llm)
         results_log.append(r)
 
-    with open("test_results.json", "w", encoding="utf-8") as f:
+    BASE_DIR = Path(__file__).resolve().parent
+    RESULTS_PATH = BASE_DIR.parent / "reports" / "test_results.json"
+    with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(results_log, f, ensure_ascii=False, indent=2)
     print(f"\nРезультаты сохранены в test_results.json")
 

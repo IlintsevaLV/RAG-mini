@@ -12,9 +12,13 @@ import time
 
 
 # Пути
-CHUNKS_PATH = Path("chunks.json")
-INDEX_PATH = Path("faiss.index")
-MODEL_PATH = Path("models/qwen2.5-3b-instruct-q4_k_m.gguf")
+# Пути
+BASE_DIR = Path(__file__).resolve().parent      # main_pipeline/
+PROJECT_ROOT = BASE_DIR.parent                  # RAG-mini/
+CHUNKS_PATH = BASE_DIR / "chunks.json"
+INDEX_PATH = BASE_DIR / "faiss.index"
+MODEL_PATH = PROJECT_ROOT / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf"
+
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
