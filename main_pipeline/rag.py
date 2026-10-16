@@ -9,9 +9,9 @@ from pathlib import Path
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from llama_cpp import Llama
 import time
+from rank_bm25 import BM25Okapi
 
 
-# Пути
 # Пути
 BASE_DIR = Path(__file__).resolve().parent      # main_pipeline/
 PROJECT_ROOT = BASE_DIR.parent                  # RAG-mini/
@@ -23,10 +23,16 @@ EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 # Параметры retrieval
-TOP_K_INITIAL = 15      # сколько кандидатов берём из FAISS
-K_RERANK = 2            # top-N по rerank
-K_EMBED = 3             # +top-N по embed
-TOP_K_FINAL = K_RERANK + K_EMBED
+TOP_K_INITIAL = 20       # FAISS top-N
+TOP_K_BM25 = 20          # BM25 top-N
+RRF_K = 60               # константа сглаживания RRF
+RRF_TOP_N = 20           # сколько чанков оставляем после RRF (идут в reranker)
+TOP_K_FINAL = 6          # сколько чанков идёт в LLM после reranker'а
+
+# Параметры расширения таблиц
+MAX_ADDED_PARTS = 3            # добавить не больше 3 новых частей таблицы
+MAX_ADDED_CHARS = 6000         # добавить не больше 6000 новых символов
+MIN_RERANK_TO_EXPAND = 0.5     # порог: расширяем только если rerank таблицы выше
 
 # Параметры LLM
 MAX_TOKENS = 500
@@ -37,7 +43,7 @@ N_THREADS = 6
 
 
 def load_resources(verbose=True):
-    """Загружает chunks, FAISS-индекс, модель эмбеддингов, reranker, LLM."""
+    """Загружает chunks, FAISS-индекс, BM25-индекс, embed-модель, reranker, LLM."""
     if verbose:
         print("Загружаю ресурсы...")
     t0 = time.time()
@@ -46,6 +52,11 @@ def load_resources(verbose=True):
         chunks = json.load(f)
 
     index = faiss.read_index(str(INDEX_PATH))
+
+    if verbose:
+        print("   Строю BM25-индекс...")
+    tokenized = [c["text"].lower().split() for c in chunks]
+    bm25 = BM25Okapi(tokenized)
 
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 
@@ -65,7 +76,7 @@ def load_resources(verbose=True):
     if verbose:
         print(f"   Готово за {time.time() - t0:.1f} сек\n")
 
-    return chunks, index, embed_model, reranker, llm
+    return chunks, index, embed_model, reranker, llm, bm25
 
 # Retrieval
 def retrieve_initial(query, chunks, index, embed_model, k=TOP_K_INITIAL):
@@ -88,9 +99,74 @@ def retrieve_initial(query, chunks, index, embed_model, k=TOP_K_INITIAL):
             "pages": c["pages"],
             "chunk_id": c["chunk_id"],
             "source": c.get("source", "?"),
+            "type": c.get("type", "content"),
+            "table_caption": c.get("table_caption", ""),
+            "table_group": c.get("table_group", None),
+            "table_part": c.get("table_part", None),
         })
     return results
 
+def retrieve_bm25(query, chunks, bm25, k=TOP_K_BM25):
+    """BM25-поиск: ловит точные совпадения слов/чисел/аббревиатур.
+
+    Возвращает список чанков с полем score_bm25.
+    """
+    tokens = query.lower().split()
+    scores = bm25.get_scores(tokens)
+
+    # Индексы top-k по убыванию
+    top_idx = np.argsort(scores)[::-1][:k]
+
+    results = []
+    for idx in top_idx:
+        c = chunks[idx]
+        results.append({
+            "score_bm25": float(scores[idx]),
+            "text": c["text"],
+            "page_span": c["page_span"],
+            "pages": c["pages"],
+            "chunk_id": c["chunk_id"],
+            "source": c.get("source", "?"),
+            "type": c.get("type", "content"),
+            "table_caption": c.get("table_caption", ""),
+            "table_group": c.get("table_group", None),
+            "table_part": c.get("table_part", None),
+        })
+    return results
+
+def rrf_fusion(rankings, k=RRF_K, top_n=RRF_TOP_N):
+    """Reciprocal Rank Fusion: объединяет несколько ранжирований в одно.
+
+    Args:
+        rankings: список ранжирований. Каждое — список чанков (dict),
+                  упорядоченных по релевантности (лучший — первый).
+        k: константа сглаживания RRF (обычно 60).
+        top_n: сколько чанков вернуть.
+
+    Returns:
+        Список чанков, упорядоченных по RRF-скору.
+
+    Формула:
+        RRF_score(chunk) = Σ_i 1 / (k + rank_i(chunk))
+    """
+    scores = {}
+    lookup = {}
+
+    for ranking in rankings:
+        for rank, c in enumerate(ranking, 1):
+            cid = c["chunk_id"]
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+            # Сохраняем первый попавшийся объект чанка (можно любой)
+            if cid not in lookup:
+                lookup[cid] = c
+
+    sorted_ids = sorted(scores.keys(), key=lambda cid: -scores[cid])
+    result = []
+    for cid in sorted_ids[:top_n]:
+        chunk = lookup[cid].copy()
+        chunk["score_rrf"] = scores[cid]
+        result.append(chunk)
+    return result
 
 def rerank_candidates(query, candidates, reranker):
     """Считает rerank-скоры для всех кандидатов."""
@@ -101,37 +177,121 @@ def rerank_candidates(query, candidates, reranker):
     return candidates
 
 
-def hybrid_select(candidates, k_rerank=K_RERANK, k_embed=K_EMBED):
-    """top-k_rerank по rerank + top-k_embed по embed (без пересечений)."""
-    by_rerank = sorted(candidates, key=lambda c: c["score_rerank"], reverse=True)
-    selected = by_rerank[:k_rerank]
+def expand_table_neighbors(selected, chunks, min_rerank_score=MIN_RERANK_TO_EXPAND):
+    """Подтягивает соседние части ОДНОЙ таблицы, если её rerank выше порога.
+
+    Логика:
+        - Находит табличные чанки в selected с их table_group.
+        - Берёт группу с максимальным score_rerank.
+        - Если score_rerank < min_rerank_score → не расширяем (таблица нерелевантна).
+        - Иначе дотягивает недостающие части той же таблицы из chunks.
+        - Лимиты: не больше MAX_ADDED_PARTS частей и MAX_ADDED_CHARS символов.
+    """
     selected_ids = {c["chunk_id"] for c in selected}
 
-    by_embed = sorted(candidates, key=lambda c: c["score_embed"], reverse=True)
-    for c in by_embed:
-        if len(selected) >= k_rerank + k_embed:
+    # 1. Табличные чанки в selected
+    tables_in_selected = [
+        (c, c.get("table_group"))
+        for c in selected
+        if c.get("table_group")
+    ]
+    if not tables_in_selected:
+        return selected
+
+    # 2. Берём самую релевантную таблицу
+    tables_in_selected.sort(
+        key=lambda x: x[0].get("score_rerank", 0), reverse=True
+    )
+    best_chunk, best_group = tables_in_selected[0]
+
+    # 3. Фильтр по скору
+    if best_chunk.get("score_rerank", 0) < min_rerank_score:
+        return selected
+
+    # 4. Все части этой таблицы
+    all_parts = [c for c in chunks if c.get("table_group") == best_group]
+    if not all_parts:
+        return selected
+
+    all_parts_sorted = sorted(all_parts, key=lambda c: c.get("table_part", 0))
+
+    # Уже в контексте
+    already = [c for c in all_parts_sorted if c["chunk_id"] in selected_ids]
+
+    # Кандидаты на добавление
+    candidates = [c for c in all_parts_sorted if c["chunk_id"] not in selected_ids]
+
+    # Сортируем: сначала ближайшие по table_part к уже выбранным
+    def distance_to_selected(c):
+        part = c.get("table_part", 0)
+        return min(abs(part - sel.get("table_part", 0)) for sel in already)
+
+    candidates.sort(key=distance_to_selected)
+
+    # 5. Добавляем с лимитами
+    expanded = list(selected)
+    added_count = 0
+    added_chars = 0
+
+    for c in candidates:
+        if added_count >= MAX_ADDED_PARTS:
             break
-        if c["chunk_id"] not in selected_ids:
-            selected.append(c)
-            selected_ids.add(c["chunk_id"])
+        if added_chars + c["n_chars"] > MAX_ADDED_CHARS:
+            break
+        expanded.append(c)
+        added_count += 1
+        added_chars += c["n_chars"]
+
+    return expanded
+
+def retrieve(query, chunks, index, embed_model, reranker, bm25):
+    """Гибридный retrieval:
+        1. FAISS top-N (семантика)
+        2. BM25 top-N (ключевые слова)
+        3. RRF: объединение двух ранжирований
+        4. Reranker: точная пересортировка top-RRF_TOP_N
+        5. Top-TOP_K_FINAL по reranker'у
+        6. expand_table_neighbors — дотягиваем соседние части таблиц
+    """
+    # 1. FAISS
+    faiss_res = retrieve_initial(query, chunks, index, embed_model, k=TOP_K_INITIAL)
+
+    # 2. BM25
+    bm25_res = retrieve_bm25(query, chunks, bm25, k=TOP_K_BM25)
+
+    # 3. RRF
+    fused = rrf_fusion([faiss_res, bm25_res], k=RRF_K, top_n=RRF_TOP_N)
+
+    # 4. Reranker по объединённому пулу
+    fused = rerank_candidates(query, fused, reranker)
+
+    # 5. Top-K по reranker'у
+    selected = sorted(fused, key=lambda c: c["score_rerank"], reverse=True)[:TOP_K_FINAL]
+
+    # 6. Расширение таблиц
+    n_before = len(selected)
+    selected = expand_table_neighbors(selected, chunks)
+    n_after = len(selected)
+
+    if n_after > n_before:
+        print(f"   [expand_table_neighbors: {n_before} → {n_after} чанков]")
 
     return selected
-
-
-def retrieve(query, chunks, index, embed_model, reranker):
-    """Полный retrieval: FAISS top-N → rerank → гибридный отбор."""
-    candidates = retrieve_initial(query, chunks, index, embed_model, k=TOP_K_INITIAL)
-    candidates = rerank_candidates(query, candidates, reranker)
-    return hybrid_select(candidates, k_rerank=K_RERANK, k_embed=K_EMBED)
 
 # Промпт и генерация
 def build_prompt(query, retrieved):
     context_parts = []
     for i, r in enumerate(retrieved, 1):
         source = r.get("source", "?")
-        context_parts.append(
-             f"[Фрагмент {i}, документ: «{source}», стр. {r['page_span']}]\n{r['text']}"
-        )
+        if r.get("type") == "table":
+            caption = r.get("table_caption") or "(без заголовка)"
+            context_parts.append(
+                f"[Фрагмент {i}, ТАБЛИЦА «{caption}», документ: «{source}», стр. {r['page_span']}]\n{r['text']}"
+            )
+        else:
+            context_parts.append(
+                f"[Фрагмент {i}, документ: «{source}», стр. {r['page_span']}]\n{r['text']}"
+            )
     context = "\n\n".join(context_parts)
 
     prompt = f"""Ответь на вопрос, используя ТОЛЬКО приведённый ниже контекст.
@@ -237,9 +397,8 @@ def clean_answer(text):
             unique.append(s)
     text = " ".join(unique).strip()
 
-    # ============================================================
     # 6. ГЛАВНОЕ: если ответ содержит "нет ответа" — возвращаем ТОЛЬКО эту фразу
-    # ============================================================
+
     if "нет ответа на этот вопрос" in text.lower():
         return "В документе нет ответа на этот вопрос"
 
@@ -251,17 +410,28 @@ def clean_answer(text):
 
 
 # Основной RAG
-def answer_one(query, chunks, index, embed_model, reranker, llm, verbose=True):
+def answer_one(query, chunks, index, embed_model, reranker, llm, bm25, verbose=True):
     """Полный RAG-цикл для одного вопроса."""
     t0 = time.time()
-    retrieved = retrieve(query, chunks, index, embed_model, reranker)
+    retrieved = retrieve(query, chunks, index, embed_model, reranker, bm25)
     t_ret = time.time() - t0
 
     if verbose:
-        print(f"\nТоп-{TOP_K_FINAL} (за {t_ret:.2f} сек):")
+        print(f"\nТоп-{len(retrieved)} (за {t_ret:.2f} сек):")
         for i, r in enumerate(retrieved, 1):
-            print(f"   [{i}] embed={r['score_embed']:.3f}, "
-                  f"rerank={r['score_rerank']:.3f}, стр. {r['page_span']}")
+            type_marker = "TABLE" if r.get("type") == "table" else "text "
+            caption_info = ""
+            if r.get("type") == "table" and r.get("table_caption"):
+                caption_info = f", «{r['table_caption']}»"
+
+            # Новые чанки (из expand_table_neighbors) не имеют score_embed/score_rerank
+            embed_val = r.get("score_embed")
+            rerank_val = r.get("score_rerank")
+            embed_str = f"{embed_val:.3f}" if embed_val is not None else "  —  "
+            rerank_str = f"{rerank_val:.3f}" if rerank_val is not None else "  —  "
+
+            print(f"   [{i}] {type_marker} embed={embed_str}, "
+                  f"rerank={rerank_str}, стр. {r['page_span']}{caption_info}")
 
     prompt = build_prompt(query, retrieved)
 

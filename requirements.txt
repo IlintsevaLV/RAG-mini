@@ -72,3 +72,4 @@ uuid_utils==0.17.1
 websockets==17.2
 xxhash==4.0.1
 zstandard==0.25.0
+rank_bm25
